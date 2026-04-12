@@ -1,7 +1,7 @@
 /*
- * PROJECT: Marine Crane AI - RFID Auth Node
- * HARDWARE: ESP32-C3 Mini
- * SENSORS: RC522 RFID Module (SPI)
+ * PROJECT: Marine Crane AI - RFID Oyster Cage Tracker
+ * HARDWARE: ESP32-C3 Mini + RC522 RFID Module (SPI)
+ * FUNCTION: Translates Tag UIDs to Cage IDs and sends to Hub
  */
 
 #include <esp_now.h>
@@ -9,19 +9,25 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
-// ESP32-C3 SPI Pins
 #define RST_PIN   3     
 #define SS_PIN    7     
 MFRC522 mfrc522(SS_PIN, RST_PIN);  
 
-// TODO: Replace with the UID of your personal Master Tag
-String AUTHORIZED_UID = "A1 B2 C3 D4"; 
-
 // TODO: Replace with Hub MAC Address
 uint8_t hubAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; 
 
-bool system_unlocked = false;
-unsigned long last_transmit_time = 0;
+// --- The Oyster Cage Database ---
+// Map your physical RFID tags to your farm's cage numbers here
+int identifyCage(String uid) {
+    if (uid == "A1 B2 C3 D4") return 101;
+    if (uid == "DE AD BE EF") return 102;
+    if (uid == "11 22 33 44") return 103;
+    return 999; // 999 = Unknown/Unregistered Cage
+}
+
+int current_cage_id = 0; // 0 means no cage on hook
+unsigned long last_scan_time = 0;
+const unsigned long CAGE_TIMEOUT_MS = 30000; // Clear cage ID after 30 seconds
 
 typedef struct struct_message {
     uint8_t node_type;    
@@ -32,7 +38,7 @@ struct_message myData;
 
 void setup() {
     Serial.begin(115200);
-    SPI.begin(6, 4, 5, 7); // SCK, MISO, MOSI, SS for C3 hardware SPI
+    SPI.begin(6, 4, 5, 7); 
     mfrc522.PCD_Init(); 
 
     WiFi.mode(WIFI_STA);
@@ -45,11 +51,11 @@ void setup() {
     esp_now_add_peer(&peerInfo);
 
     myData.node_type = 4; // ID: RFID Station
-    Serial.println("RFID Node Online. Waiting for card tap...");
+    Serial.println("Oyster Tracker Online. Waiting for cages...");
 }
 
 void loop() {
-    // Read Card if present
+    // 1. Handle New Tag Scans
     if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
         String tagUID = "";
         for (byte i = 0; i < mfrc522.uid.size; i++) {
@@ -59,21 +65,28 @@ void loop() {
         tagUID.trim();
         tagUID.toUpperCase();
         
-        Serial.println("Card Detected: " + tagUID);
-
-        if (tagUID == AUTHORIZED_UID) {
-            system_unlocked = !system_unlocked; // Toggle lock state on tap
-            Serial.println(system_unlocked ? "SYSTEM UNLOCKED" : "SYSTEM LOCKED");
-            delay(1000); // Debounce to prevent rapid toggling
-        }
+        // Translate UID to Farm Cage Number
+        current_cage_id = identifyCage(tagUID);
+        last_scan_time = millis();
+        
+        Serial.printf("Cage Scanned: #%d (UID: %s)\n", current_cage_id, tagUID.c_str());
+        
+        // Instantly transmit the new cage ID
+        myData.value_1 = (float)current_cage_id;
+        myData.status_flag = true; // Flag indicates active scan
+        esp_now_send(hubAddress, (uint8_t *) &myData, sizeof(myData));
+        
+        delay(1000); // Anti-spam debounce
     }
 
-    // Ping the Hub once a second with the auth status
-    if (millis() - last_transmit_time >= 1000) {
-        myData.value_1 = 0; // Unused for RFID
-        myData.status_flag = system_unlocked;
+    // 2. Auto-Clear the active cage if nothing is scanned for 30 seconds
+    // (Assuming you finished lifting it and swung it onto the deck)
+    if (current_cage_id != 0 && (millis() - last_scan_time > CAGE_TIMEOUT_MS)) {
+        current_cage_id = 0;
+        Serial.println("Cage timeout. Hook empty.");
         
+        myData.value_1 = 0.0;
+        myData.status_flag = false;
         esp_now_send(hubAddress, (uint8_t *) &myData, sizeof(myData));
-        last_transmit_time = millis();
     }
 }
